@@ -6,12 +6,11 @@ function Convert-KVPArrayToHashtable {
   )
   $ret = @{}
   ForEach ($pair in $KeyValuePairs){
+      Write-Verbose " $($pair.Key) => $($pair.Value)"
       $ret[$pair.Key] = $pair.Value
   }
   $ret
 }
-
-
 
 function EvalData {
 <#
@@ -42,7 +41,6 @@ A flat hash of values: ColumnName => Value
     }
     $ret
 }
-
 
 function Get-SelectQuery {
 <#
@@ -308,15 +306,17 @@ function Get-TargetResource {
         [System.String]
         $Table
     )
-    $SQLData = Convert-KVPArrayToHashtable $SQLData
-    $SQLData[$KeyColumn] = $Key
-    $SQLData = EvalData $SQLData
+    $SQLDataHash = Convert-KVPArrayToHashtable $SQLData
+    $SQLDataHash[$KeyColumn] = $Key
+    $SQLDataHash = EvalData $SQLDataHash
+
+    Write-Debug "data hash $($SQLDataHash | ConvertTo-Json)"
 
     $connection = [System.Data.SqlClient.SqlClientFactory]::Instance.CreateConnection()
     $connection.ConnectionString = $ConnectionString
     $connection.Open()
-    $query = Get-SelectQuery -Connection $connection -Table $Table -Data $SQLData
-    write-debug "query: $($query.CommandText)"
+    $query = Get-SelectQuery -Connection $connection -Table $Table -SQLData $SQLDataHash
+    Write-Debug "query: $($query.CommandText)"
     $reader = $query.ExecuteReader()
     if($reader.HasRows){
         $reader.Read() | Out-Null
@@ -324,12 +324,14 @@ function Get-TargetResource {
         foreach( $i in 0 .. ($reader.FieldCount-1)){
             $ret[$reader.GetName($i)] = $reader.Item($i)
         }
+        $reader.Close()
+        $connection.Close()
         return $ret
     }else{
+        $reader.Close()
+        $connection.Close()
         return $null
     }
-    $connection.Close()
-
 }
 
 
@@ -360,45 +362,54 @@ function Set-TargetResource {
         [System.String]
         $Ensure
     )
+    $SQLDataHash = Convert-KVPArrayToHashtable $SQLData
+    $SQLDataHash[$KeyColumn] = $Key
+    $SQLDataHash = EvalData $SQLDataHash
+    Write-Debug "data hash $($SQLDataHash | ConvertTo-Json)"
+    $keyData = EvalData @{$KeyColumn = $Key}
+    Write-Debug "keyData $($keyData | ConvertTo-Json)"
 
-    $SQLData = Convert-KVPArrayToHashtable $SQLData
-    $SQLData[$KeyColumn] = $Key
-    $SQLData = EvalData $SQLData
-    $res = Get-TargetResource -Key $Key -ConnectionString $ConnectionString -Data @{$KeyColumn = $Key} -Table $Table
-    if ( $res -eq $null -and $Ensure -eq "Present"){
-        Write-Debug "Resource missing. Attempting to insert."
-        $connection = [System.Data.SqlClient.SqlClientFactory]::Instance.CreateConnection()
-        $connection.ConnectionString = $ConnectionString
-        $connection.Open()
-        $query = Get-InsertQuery -Connection $connection -Table $Table -Data $SQLData
-        write-debug "query: $($query.CommandText)"
+    $connection = [System.Data.SqlClient.SqlClientFactory]::Instance.CreateConnection()
+    $connection.ConnectionString = $ConnectionString
+    $connection.Open()
+    $query = Get-SelectQuery -Connection $connection -Table $Table -SQLData $keyData
+    Write-Debug "query: $($query.CommandText)"
+    $reader = $query.ExecuteReader()
+    $currentData = $null
+    if($reader.HasRows){
+        $reader.Read() | Out-Null
+        $currentData = @{}
+        foreach( $i in 0 .. ($reader.FieldCount-1)){
+            $currentData[$reader.GetName($i)] = $reader.Item($i)
+        }
+    }
+    $reader.Close()
+     Write-Debug "current data $($currentData | ConvertTo-Json)"
+    if ( $currentData  -eq $null -and $Ensure -eq "Present"){
+        Write-Verbose "Resource missing. Attempting to insert."
+        $query = Get-InsertQuery -Connection $connection -Table $Table -SQLData $SQLDataHash
+        Write-Debug "query: $($query.CommandText)"
         $query.ExecuteNonQuery() | Out-Null
         $connection.Close()
-    } elseif( $res -ne $null -and $Ensure -eq "Present" ){
-        Write-Debug "Resource exists."
+    } elseif( $currentData  -ne $null -and $Ensure -eq "Present" ){
+        write-verbose "Resource exists."
         $match = $true
-        foreach($entry in $SQLData.GetEnumerator()){
-            if(-not $res.ContainsKey($entry.Key) -or ($res[$entry.Key] -ne $entry.Value)){
-                Write-Debug "Wrong value for $($entry.Key): is $($res[$entry.Key]), should be $($entry.Value)."
+        foreach($entry in $SQLDataHash.GetEnumerator()){
+            if(-not $currentData.ContainsKey($entry.Key) -or ($currentData[$entry.Key] -ne $entry.Value)){
+                Write-Debug "Wrong value for $($entry.Key): is $($currentData[$entry.Key]), should be $($entry.Value)."
                 $match = $false
                 break
             }
         }
         if(-not $match){
-            Write-Debug "Resource values need updating."
-            $connection = [System.Data.SqlClient.SqlClientFactory]::Instance.CreateConnection()
-            $connection.ConnectionString = $ConnectionString
-            $connection.Open()
-            $query = Get-UpdateQuery -Connection $connection -Table $Table -Data $SQLData -WhereData @{$KeyColumn = $Key}
+            write-verbose "Resource values need updating."
+            $query = Get-UpdateQuery -Connection $connection -Table $Table -SQLData $SQLDataHash -WhereData $keyData
             $query.ExecuteNonQuery() | Out-Null
             $connection.Close()
         }
-    } elseif( $res -ne $null -and $Ensure -eq "Absent"){
-        Write-Debug "Resource needs to be deleted."
-        $connection = [System.Data.SqlClient.SqlClientFactory]::Instance.CreateConnection()
-        $connection.ConnectionString = $ConnectionString
-        $connection.Open()
-        $query = Get-DeleteQuery -Connection $connection -Table $Table -WhereData @{$KeyColumn = $Key}
+    } elseif( $currentData -ne $null -and $Ensure -eq "Absent"){
+        write-verbose "Resource needs to be deleted."
+        $query = Get-DeleteQuery -Connection $connection -Table $Table -WhereData $keyData
         $query.ExecuteNonQuery() | Out-Null
         $connection.Close()
     }
@@ -435,11 +446,7 @@ function Test-TargetResource
         [System.String]
         $Ensure
     )
-
-    $SQLData = Convert-KVPArrayToHashtable $SQLData
-    $SQLData[$KeyColumn] = $Key
-    $SQLData = EvalData $SQLData
-    $res = Get-TargetResource -Key $Key -KeyColumn $KeyColumn -ConnectionString $ConnectionString -Data $SQLData -Table $Table
+    $res = Get-TargetResource -Key $Key -KeyColumn $KeyColumn -ConnectionString $ConnectionString -SQLData $SQLData -Table $Table
     $json = $res | ConvertTo-Json
     Write-Debug "json: $json"
     return ( $res -eq $null ) -xor ( $Ensure -eq 'Present')
@@ -447,4 +454,3 @@ function Test-TargetResource
 
 
 Export-ModuleMember -Function *-TargetResource
-
